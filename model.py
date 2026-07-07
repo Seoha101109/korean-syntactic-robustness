@@ -11,6 +11,8 @@ from google.colab import drive
 drive.mount('/content/drive')
 drive_path = "/content/drive/MyDrive/model_data"
 
+pip install "git+https://github.com/SKTBrain/KoBERT.git#egg=kobert_tokenizer&subdirectory=kobert_hf"
+
 import torch
 import json
 import os
@@ -19,6 +21,7 @@ from huggingface_hub import login
 hf_token = userdata.get('HF_TOKEN')
 login(token=hf_token)
 from transformers import AutoModel, AutoTokenizer, BertTokenizer, logging as tf_logging
+from kobert_tokenizer import KoBERTTokenizer
 
 # 허깅페이스 경고 메시지 무시 설정
 tf_logging.set_verbosity_error()
@@ -37,9 +40,11 @@ model_name = ['monologg/kobert',
 #'google-bert/bert-base-multilingual-cased',
 #'meta-llama/Llama-3.2-3B'
 
-target_model = model_name[4]
-tokenizer = AutoTokenizer.from_pretrained(target_model)
-#tokenizer = BertTokenizer.from_pretrained(target_model, use_fast=False)
+target_model = model_name[0]
+if target_model == r"monologg/kobert":
+  tokenizer = KoBERTTokenizer.from_pretrained(target_model, trust_remote_code=True)
+else:
+  tokenizer = AutoTokenizer.from_pretrained(target_model)
 model = AutoModel.from_pretrained(target_model,device_map="auto")
 model.eval() #regularization 생략함(random성X)
 
