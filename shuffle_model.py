@@ -11,6 +11,8 @@ from google.colab import drive
 drive.mount('/content/drive')
 drive_path = "/content/drive/MyDrive/model_data"
 
+pip install "git+https://github.com/SKTBrain/KoBERT.git#egg=kobert_tokenizer&subdirectory=kobert_hf"
+
 import numpy as np
 import torch
 import json
@@ -20,6 +22,7 @@ from huggingface_hub import login
 hf_token = userdata.get('HF_TOKEN')
 login(token=hf_token)
 from transformers import AutoModel, AutoTokenizer, BertTokenizer, logging as tf_logging
+from kobert_tokenizer import KoBERTTokenizer
 
 # 허깅페이스 경고 메시지 무시 설정
 tf_logging.set_verbosity_error()
@@ -41,8 +44,10 @@ model = ['monologg/kobert',
 
 target_model = model[0]
 model_name = target_model.replace("/", "_")
-#tokenizer = AutoTokenizer.from_pretrained(target_model)
-tokenizer = BertTokenizer.from_pretrained(target_model, use_fast=False)
+if target_model == r"monologg/kobert":
+  tokenizer = KoBERTTokenizer.from_pretrained(target_model, trust_remote_code=True)
+else:
+  tokenizer = AutoTokenizer.from_pretrained(target_model)
 model = AutoModel.from_pretrained(target_model,device_map="auto")
 model.eval() #regularization 생략함(random성X)
 
@@ -61,36 +66,43 @@ inputs_separate = tokenizer(separate_sentence, padding=True, return_tensors="pt"
 save_path = f"/content/drive/MyDrive/tokenizer/{model_name}_tokenizer.pt"
 torch.save({"composite": inputs_composite['attention_mask'], "separate": inputs_separate["attention_mask"]} , save_path)
 
-
-#shuffle
+# 1. 셔플을 위한 무작위 난수 생성기 설정 (결과 재현을 위해 시드 고정)
 rng = np.random.default_rng(seed=42)
 
+# 2. 기존 GPU에 올라가 있는 input_ids 복사 및 텐서 변환 준비
 input_ids_batch = inputs_separate["input_ids"].clone().cpu()
 attn_batch = inputs_separate["attention_mask"].clone().cpu()
 
 shuffled_input_ids_list = []
 
+# 3. 293개의 문장을 한 개씩 순회하며 실제 단어 토큰만 골라 셔플
 for input_ids, attn_mask in zip(input_ids_batch, attn_batch):
+
+    # 해당 모델의 토크나이저 기준으로 특수 토큰([CLS], [SEP], [PAD] 등) 위치 마스크 추출
     special_mask = tokenizer.get_special_tokens_mask(
         input_ids.tolist(), already_has_special_tokens=True
     )
 
+    # 특수 토큰이 아니고(m==0) 동시에 패딩이 아닌 실제 단어 토큰(a==1)의 인덱스만 추출
     content_positions = [
         i for i, (m, a) in enumerate(zip(special_mask, attn_mask.tolist()))
         if m == 0 and a == 1
     ]
 
+    # 실제 단어 위치 리스트를 복사한 뒤 순서를 무작위로 뒤섞음
     shuffled_positions = content_positions.copy()
     rng.shuffle(shuffled_positions)
 
+    # 원본 토큰 행렬에서 '실제 단어 위치'에만 순서가 섞인 토큰들을 대입
     new_input_ids = input_ids.clone()
     new_input_ids[content_positions] = input_ids[shuffled_positions]
 
     shuffled_input_ids_list.append(new_input_ids)
 
+# 4. 셔플이 완료된 토큰들을 다시 하나의 배치가 담긴 텐서로 묶고 GPU로 전송
 inputs_separate = {
     "input_ids": torch.stack(shuffled_input_ids_list).to("cuda"),
-    "attention_mask": inputs_separate["attention_mask"].to("cuda")
+    "attention_mask": inputs_separate["attention_mask"].to("cuda") # 마스크 위치는 원본과 동일
 }
 
 
@@ -107,15 +119,9 @@ save_path_separate = os.path.join(save_dir, f"{model_name}_separate.pt")
 torch.save(outputs_composite.hidden_states, save_path_composite)
 torch.save(outputs_separate.hidden_states, save_path_separate)
 
-
-
-
-
-
-
 import torch
 
-model_name = "google-bert_bert-base-multilingual-cased"
+model_name = "monologg_kobert"
 
 composite_path = f"/content/drive/MyDrive/model_data/{model_name}_composite.pt"
 separate_path = f"/content/drive/MyDrive/model_data/{model_name}_separate.pt"
@@ -141,11 +147,6 @@ print(len(data_separate[0][0,:,0]))
 #snunlp_KR-BERT-char16424
 #size linenumber = 293, composite maxtoken = 92, separate maxtoken = 92, hidden dimension = 768
 
-
-
-
-
-#debiased cka
 import os
 import torch
 import numpy as np
@@ -158,6 +159,8 @@ if not os.path.exists(folder):
 
 
 def debiased_hsic(A, B):
+    """Song et al. (2012) unbiased HSIC estimator.
+    대각선(자기 자신과의 유사도)을 0으로 만들어 유한표본 편향을 제거."""
     n = A.shape[0]
     A = A.copy()
     B = B.copy()
@@ -171,6 +174,10 @@ def debiased_hsic(A, B):
 
 
 def whiten_features(X, eps=1e-6):
+    """공분산 구조를 항등행렬로 만드는 whitening (anisotropy 제거).
+    n < p (293 < 768) 상황에서도 안정적으로 동작하도록 SVD 기반으로 구현.
+    반드시 '전체 표본'으로 한 번만 호출할 것 - 작은 서브샘플에 매번 적용하면
+    불안정해져서 오히려 편향이 생긴다 (실증됨)."""
     X = X - X.mean(axis=0, keepdims=True)
     U, S, Vt = np.linalg.svd(X, full_matrices=False)
     S_inv = 1.0 / np.sqrt(S**2 / (X.shape[0] - 1) + eps)
@@ -178,6 +185,10 @@ def whiten_features(X, eps=1e-6):
 
 
 def linear_CKA_debiased(X, Y):
+    """linear_CKA와 동일한 인터페이스의 debiased 버전.
+    오프대각선(실제 쌍별 관계 구조) 전체를 그대로 사용하며,
+    대각선만 Song et al. 방식으로 0으로 지워 유한표본 편향을 보정한다.
+    분모(HSIC(K,K) 또는 HSIC(L,L))가 0 이하면 PSD 붕괴로 인한 불안정 신호이므로 None 반환."""
     X = X - X.mean(axis=0, keepdims=True)
     Y = Y - Y.mean(axis=0, keepdims=True)
     K = X @ X.T
@@ -189,15 +200,15 @@ def linear_CKA_debiased(X, Y):
     return debiased_hsic(K, L) / np.sqrt(hkk * hll)
 
 
-means = []  # 레이어마다 CKA 값
+means = []  # 레이어마다 전체(293개)로 계산한 단일 CKA 값
 
 # 마스크 로드
 mask_data = torch.load(
     f"/content/drive/MyDrive/tokenizer/{model_name}_tokenizer.pt",
     map_location=torch.device('cpu'),
 )
-mask_X = mask_data['composite'].float()
-mask_Y = mask_data['separate'].float()
+mask_X = mask_data['composite'].float()  # (293, seq_len_composite)
+mask_Y = mask_data['separate'].float()   # (293, seq_len_separate)
 
 for n in range(13):
     X_raw = data_composite[n].cpu()  # (293, seq_len, 768)
@@ -213,12 +224,16 @@ for n in range(13):
     X_clean = X_clean.detach().numpy()
     Y_clean = Y_clean.detach().numpy()
 
+    # --- Whitening: 전체 293개로 1회 추정 (anisotropy 제거) ---
     X_white = whiten_features(X_clean)
     Y_white = whiten_features(Y_clean)
 
+    # --- 부트스트랩 없이, 전체 293개로 레이어당 CKA를 '단 한 번' 계산 ---
+    # (n=100 서브샘플링은 debiased HSIC의 분모를 불안정하게 만들어
+    #  오히려 분산을 키운다는 것이 반복 검증되었으므로 제거함)
     score = linear_CKA_debiased(X_white, Y_white)
     if score is None:
-        print(f"데이터 확인 필요")
+        print(f"[경고] 레이어 {n}: 분모가 0 이하로 계산 불가 - 데이터 확인 필요")
         score = float('nan')
 
     means.append(score)
@@ -240,14 +255,12 @@ filepath = f"{folder}/{model_name}_debiased_cka_graph.pdf"
 plt.savefig(filepath, dpi=300, bbox_inches="tight")
 plt.show()
 
-#결과 저장
+# 수치 결과 저장 (재현성/부록용)
 np.savez(
     f"{folder}/{model_name}_debiased_cka_values.npz",
     layers=layers, means=means_arr,
 )
 
-
-#t-SNE
 import sklearn as sk
 
 n_lower = 2
